@@ -1,0 +1,24 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.5.2.0
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PabReader", "PabReader.csproj", "{6C6CD31B-309E-B372-10D7-DB22CA35DB1A}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{6C6CD31B-309E-B372-10D7-DB22CA35DB1A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{6C6CD31B-309E-B372-10D7-DB22CA35DB1A}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{6C6CD31B-309E-B372-10D7-DB22CA35DB1A}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{6C6CD31B-309E-B372-10D7-DB22CA35DB1A}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {5744C94F-9D91-41F2-A0BD-06B17254C4BC}
+	EndGlobalSection
+EndGlobal
