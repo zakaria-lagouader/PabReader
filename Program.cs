@@ -105,7 +105,7 @@ namespace PabReader
 
             app.MapGet("/device-proof", (DeviceIdentityService deviceService, IOptions<SerialSettings> settings) =>
             {
-                return Results.Json(deviceService.GenerateProof(settings.Value.PontId));
+                return Results.Json(deviceService.GenerateProof());
             });
 
             // Auto-register on startup
@@ -131,7 +131,9 @@ namespace PabReader
         private byte[] _deviceSecret = Array.Empty<byte>();
         private const string DeviceIdFile = "device-id.txt";
         private const string DeviceSecretFile = "device-secret.txt";
+        private string _channel = "";
         public string DeviceId => _deviceId;
+        public string Channel => _channel;
 
         public DeviceIdentityService(ILogger<DeviceIdentityService> logger, IHttpClientFactory httpFactory, IOptions<RemoteApiSettings> options)
         {
@@ -159,6 +161,7 @@ namespace PabReader
                 File.WriteAllText(idPath, _deviceId);
                 File.WriteAllText(secPath, Convert.ToHexString(_deviceSecret));
             }
+            _channel = Guid.NewGuid().ToString("N");
         }
 
         public async Task RegisterWithApiAsync()
@@ -180,14 +183,14 @@ namespace PabReader
             }
         }
 
-        public object GenerateProof(string channelId)
+        public object GenerateProof()
         {
             var ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString();
             var nonce = Guid.NewGuid().ToString("N");
             var msg = $"{_deviceId}.{ts}.{nonce}";
             using var hmac = new HMACSHA256(_deviceSecret);
             var sigBytes = hmac.ComputeHash(Encoding.UTF8.GetBytes(msg));
-            return new { deviceId = _deviceId, ts, nonce, sig = Convert.ToHexString(sigBytes), channel = channelId };
+            return new { deviceId = _deviceId, ts, nonce, sig = Convert.ToHexString(sigBytes), channel = _channel };
         }
     }
 
@@ -219,23 +222,23 @@ namespace PabReader
             return await mgr.CreateHubContextAsync(_settings.HubName, default);
         }
 
-        public async Task BroadcastWeightAsync(string devId, string pontId, decimal w)
+        public async Task BroadcastWeightAsync(string devId, string channel, string pontId, decimal w)
         {
             var g = $"device:{devId}";
             var s = w.ToString("F2", CultureInfo.InvariantCulture);
 
             await Task.WhenAll(
-                SendSafe(_hub1, g, pontId, s)
+                SendSafe(_hub1, g, channel, pontId, s)
             );
         }
 
-        private async Task SendSafe(ServiceHubContext? h, string g, string p, string v)
+        private async Task SendSafe(ServiceHubContext? h, string g, string c, string p, string v)
         {
             if (h != null)
             {
                 try
                 {
-                    await h.Clients.Group(g).SendAsync(p, p, v);
+                    await h.Clients.Group(g).SendAsync(c, p, v);
                 }
                 catch
                 {
@@ -357,7 +360,7 @@ namespace PabReader
 
             // Log Weights  
             _logger.LogInformation("[WEIGHT LOG] PontId={Pont} Weight={Weight}", _settings.PontId, w);
-            await _signalR.BroadcastWeightAsync(_identity.DeviceId, _settings.PontId, w);
+            await _signalR.BroadcastWeightAsync(_identity.DeviceId, _identity.Channel, _settings.PontId, w);
         }
 
         public override async Task StopAsync(CancellationToken ct)
