@@ -306,7 +306,16 @@ namespace PabReader
         {
             try
             {
-                _serialPort = new SerialPort(_settings.PortName, _settings.BaudRate, Parity.None, 8, StopBits.One);
+                _serialPort = new SerialPort(_settings.PortName, _settings.BaudRate, Parity.None, 8, StopBits.One)
+                {
+                    Handshake = Handshake.None,
+                    DtrEnable = true,
+                    RtsEnable = true,
+                    Encoding = Encoding.ASCII,
+                    ReadTimeout = 1000,
+                    WriteTimeout = 500,
+                    NewLine = "\r"
+                };
                 _serialPort.DataReceived += OnData;
                 _serialPort.Open();
                 _logger.LogInformation("Serial Open");
