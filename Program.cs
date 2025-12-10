@@ -16,6 +16,7 @@ using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Linq;
 
 namespace PabReader
 {
@@ -340,36 +341,126 @@ namespace PabReader
 
         private void ProcessBuffer()
         {
-            string c = _buffer.ToString();
-            while (c.Contains("\r"))
+            while (true)
             {
-                int i = c.IndexOf("\r", StringComparison.Ordinal);
-                string f = c.Substring(0, i).Trim();
-                _buffer.Remove(0, i + 1);
-                c = _buffer.ToString();
+                string buf = _buffer.ToString();
 
-                var m = Regex.Match(f, @"[-+]?\d+(?:[.,]\d+)?");
-                if (m.Success &&
-                    decimal.TryParse(
-                        m.Value.Replace(",", "."),
-                        NumberStyles.Any,
-                        CultureInfo.InvariantCulture,
-                        out decimal w))
-                {
-                    _ = Process(w, f);
-                }
+                // Look for STX (0x02) and ETX (0x03) or CR (\r) as terminators
+                int stx = buf.IndexOf('\x02'); // STX
+                int etx = (stx >= 0) ? buf.IndexOf('\x03', stx + 1) : -1; // ETX after STX
+                int term = (etx > stx) ? etx : buf.IndexOf('\r', Math.Max(0, stx + 1));
+
+                // No complete message yet
+                if (stx < 0 && term < 0)
+                    return;
+
+                int start = (stx >= 0) ? stx + 1 : 0;
+                int end = term;
+
+                if (end <= start)
+                    return;
+
+                string payload = buf.Substring(start, end - start).Trim();
+
+                // Remove up through the terminator (ETX or CR)
+                _buffer.Remove(0, end + 1);
+
+                ProcessPayload(payload);
             }
         }
 
-        private async Task Process(decimal w, string r)
+        private void ProcessPayload(string payload)
+        {
+            if (!TryParseWeightKg(payload, out var weight))
+            {
+                _logger.LogDebug("Skip (no weight parsed) | raw: {raw}", payload);
+                return;
+            }
+
+            // Re-use your existing processing pipeline
+            _ = Process(weight, payload);
+        }
+
+        private static bool TryParseWeightKg(string text, out decimal weight)
+        {
+            // Find all numeric tokens
+            var matches = Regex.Matches(text, @"[-+]?\d+(?:[.,]\d+)?");
+            if (matches.Count == 0)
+            {
+                weight = 0;
+                return false;
+            }
+
+            var tokens = matches.Select(m => m.Value).ToList();
+
+            int Digits(string s) =>
+                s.Replace(".", "")
+                 .Replace(",", "")
+                 .TrimStart('+', '-')
+                 .Count(char.IsDigit);
+
+            // Special case: formats like "XX 1234.5 YY" (status / weight / unit)
+            if (tokens.Count == 3 && Digits(tokens[0]) <= 2 && Digits(tokens[2]) <= 2)
+            {
+                var mid = tokens[1].Replace(',', '.');
+                if (decimal.TryParse(
+                        mid,
+                        NumberStyles.Number,
+                        CultureInfo.InvariantCulture,
+                        out weight))
+                {
+                    return true;
+                }
+            }
+
+            // General case: choose the "best" candidate
+            decimal bestVal = 0;
+            int bestDigits = -1;
+            bool haveBest = false;
+
+            foreach (var raw in tokens)
+            {
+                var norm = raw.Replace(',', '.');
+
+                if (!decimal.TryParse(
+                        norm,
+                        NumberStyles.Number,
+                        CultureInfo.InvariantCulture,
+                        out var val))
+                {
+                    continue;
+                }
+
+                int d = Digits(raw);
+
+                if (!haveBest || d > bestDigits || (d == bestDigits && Math.Abs(val) > Math.Abs(bestVal)))
+                {
+                    bestVal = val;
+                    bestDigits = d;
+                    haveBest = true;
+                }
+            }
+
+            weight = haveBest ? bestVal : 0;
+            return haveBest;
+        }
+
+
+        private async Task Process(decimal w, string raw)
         {
             bool z = w == 0;
             if (z && _lastSentWasZero) return;
             _lastSentWasZero = z;
 
-            // Log Weights  
-            _logger.LogInformation("[WEIGHT LOG] PontId={Pont} Weight={Weight}", _settings.PontId, w);
-            await _signalR.BroadcastWeightAsync(_identity.DeviceId, _identity.Channel, _settings.PontId, w);
+            _logger.LogInformation(
+                "[WEIGHT LOG] PontId={Pont} Weight={Weight} Raw={Raw}",
+                _settings.PontId, w, raw);
+
+            await _signalR.BroadcastWeightAsync(
+                _identity.DeviceId,
+                _identity.Channel,
+                _settings.PontId,
+                w);
         }
 
         public override async Task StopAsync(CancellationToken ct)

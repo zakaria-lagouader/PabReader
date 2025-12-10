@@ -1,0 +1,499 @@
+// Program.cs
+using Microsoft.AspNetCore.SignalR;
+using Microsoft.Azure.SignalR.Management;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Hosting.WindowsServices;
+using Microsoft.Extensions.Logging;
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.IO.Pipes;
+using System.IO.Ports;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Channels;
+using System.Threading.Tasks;
+using System.Xml.Linq;
+
+namespace PontBasculeSystem
+{
+    public class SimulationSettings
+    {
+        public bool Simulate { get; init; }
+    }
+
+    public class Program
+    {
+        public static async Task Main(string[] args)
+        {
+            bool simulate = false;
+            if (Environment.UserInteractive)
+            {
+                Console.Write("Use real COM port? (y/n): ");
+                var key = Console.ReadKey().KeyChar;
+                Console.WriteLine();
+                simulate = !(key == 'y' || key == 'Y');
+                Console.WriteLine(simulate ? "Simulation mode." : "Real mode.");
+            }
+
+            var builder = Host.CreateDefaultBuilder(args)
+                .ConfigureServices((context, services) =>
+                {
+                    services.AddSingleton(new SimulationSettings { Simulate = simulate });
+                    services.AddHostedService<SerialPortWorker>();
+                })
+                .UseWindowsService()
+                .UseConsoleLifetime();
+
+            var host = builder.Build();
+            if (Environment.UserInteractive)
+            {
+                Console.WriteLine("Starting. Press ENTER to stop...");
+                await host.StartAsync();
+                Console.ReadLine();
+                await host.StopAsync();
+            }
+            else
+            {
+                await host.RunAsync();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Reads/simulates weights and sends ONLY to this PC's device group in Azure SignalR.
+    /// A local proof server binds web access to this physical machine.
+    /// </summary>
+    public partial class SerialPortWorker : BackgroundService
+    {
+        private readonly ILogger<SerialPortWorker> _logger;
+
+        // Two SignalR hub contexts (you had 2 envs)
+        private readonly ServiceHubContext _hub1;
+        private readonly ServiceHubContext _hub2;
+
+        private readonly bool _simulate;
+        private SerialPort? _serialPort;
+        private readonly Channel<string> _weightChannel = Channel.CreateUnbounded<string>();
+        private readonly string _logFilePath;
+        private readonly StringBuilder _receiveBuffer = new();
+        private readonly Random _random = new();
+
+        // ===== Serial port config =====
+        private const string SerialPortName = "COM1";
+        private const int BaudRate = 9600;
+        private const Parity PortParity = Parity.None;
+        private const int DataBits = 8;
+        private const StopBits StopBitsSetting = StopBits.One;
+        private const Handshake HandshakeSetting = Handshake.None;
+
+        // ===== Azure SignalR (MOVE TO CONFIG IN PROD) =====
+        private const string ServiceConnectionString1 =
+            "Endpoint=https://signalr-son-dev.service.signalr.net;AccessKey=CCMvXZopX3HnYeVcl0zbZJBEHZjtCaaIAZFUHlxdlAi1moPRFGiGJQQJ99BGAC5T7U2XJ3w3AAAAASRSWESL;Version=1.0;";
+        private const string ServiceConnectionString2 =
+            "Endpoint=https://son-pp.service.signalr.net;AccessKey=3N3A4u3fcTA582A8NvZoA1dIQysDrOOWRC3MzvnvAEhMuZbKYJ5LJQQJ99BFAC5T7U2XJ3w3AAAAASRSSrHa;Version=1.0;";
+        private const string HubName = "weight_hub_test";
+
+        // ===== Device identity & local proof =====
+        private const string DeviceIdFile = "device-id.txt";
+        private const string DeviceSecretFile = "device-secret.txt";
+        private string _deviceId = "";
+        private byte[] _deviceSecret = Array.Empty<byte>();
+        private string _groupName = "";
+        private HttpListener? _loopbackListener;
+        private static readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(5) };
+
+        // Your Negotiate/Registry API (adjust)
+        private const string ApiBase = "http://172-189-107-115.nip.io/signalrapi";
+        private const string RegistryEndpoint = ApiBase + "/api/device/register";
+        private const string RegistryAdminKey = "dev-admin-key"; // match API config
+
+        // ===== Behavior =====
+        private bool _lastSentWasZero = false;
+        private System.Threading.Timer? _simTimer;
+
+        private string _pontId = "PaB-01"; // Default value, loaded from config file
+
+        public SerialPortWorker(ILogger<SerialPortWorker> logger, SimulationSettings settings)
+        {
+            _logger = logger;
+            _simulate = settings.Simulate;
+            _logFilePath = Path.Combine(AppContext.BaseDirectory, "SerialPortWorker.log");
+            Directory.CreateDirectory(Path.GetDirectoryName(_logFilePath)!);
+
+            var mgr1 = new ServiceManagerBuilder().WithOptions(o => o.ConnectionString = ServiceConnectionString1).BuildServiceManager();
+            _hub1 = mgr1.CreateHubContextAsync(HubName, default).GetAwaiter().GetResult();
+
+            var mgr2 = new ServiceManagerBuilder().WithOptions(o => o.ConnectionString = ServiceConnectionString2).BuildServiceManager();
+            _hub2 = mgr2.CreateHubContextAsync(HubName, default).GetAwaiter().GetResult();
+        }
+
+        public override async Task StartAsync(CancellationToken ct)
+        {
+            LoadOrCreateDeviceIdentity();
+            LoadPontId();
+            _groupName = $"device:{_deviceId}";
+            _logger.LogInformation("DeviceId: {DeviceId} Group: {Group} PontId: {PontId}", _deviceId, _groupName, _pontId);
+
+            await RegisterDeviceAsync();
+
+            StartLoopbackProofServer();
+
+            if (!_simulate)
+            {
+                InitSerial();
+            }
+            else
+            {
+                _logger.LogInformation("Simulation enabled: producing weights every 1s");
+                _simTimer = new System.Threading.Timer(_ =>
+                {
+                    try { SimulateReading(); }
+                    catch (Exception ex) { LogError("Simulation tick failed", ex); }
+                }, null, TimeSpan.Zero, TimeSpan.FromSeconds(1));
+            }
+
+            _ = Task.Run(() => PipeServerLoop(ct), ct);
+            await base.StartAsync(ct);
+        }
+
+        protected override Task ExecuteAsync(CancellationToken stoppingToken) => Task.CompletedTask;
+
+        public override async Task StopAsync(CancellationToken ct)
+        {
+            _simTimer?.Dispose();
+            _loopbackListener?.Stop();
+            CloseSerial();
+            await _hub1.DisposeAsync();
+            await _hub2.DisposeAsync();
+            await base.StopAsync(ct);
+        }
+
+        // ===== Device identity =====
+        private void LoadOrCreateDeviceIdentity()
+        {
+            var baseDir = AppContext.BaseDirectory;
+            var idPath = Path.Combine(baseDir, DeviceIdFile);
+            var secPath = Path.Combine(baseDir, DeviceSecretFile);
+
+            if (File.Exists(idPath) && File.Exists(secPath))
+            {
+                _deviceId = File.ReadAllText(idPath).Trim();
+                _deviceSecret = Convert.FromHexString(File.ReadAllText(secPath).Trim());
+                return;
+            }
+
+            _deviceId = Guid.NewGuid().ToString("N");
+            _deviceSecret = RandomNumberGenerator.GetBytes(32); // 256-bit
+
+            File.WriteAllText(idPath, _deviceId);
+            File.WriteAllText(secPath, Convert.ToHexString(_deviceSecret));
+        }
+
+        private void LoadPontId()
+        {
+            var baseDir = AppContext.BaseDirectory;
+            var configPath = Path.Combine(baseDir, "pont-config.xml");
+
+            try
+            {
+                if (File.Exists(configPath))
+                {
+                    var doc = XDocument.Load(configPath);
+                    var pontIdElement = doc.Element("PontConfiguration")?.Element("PontId");
+                    if (pontIdElement != null && !string.IsNullOrWhiteSpace(pontIdElement.Value))
+                    {
+                        _pontId = pontIdElement.Value.Trim();
+                        _logger.LogInformation("Loaded PontId from config: {PontId}", _pontId);
+                        return;
+                    }
+                }
+                else
+                {
+                    // Create default config file if it doesn't exist
+                    var defaultConfig = new XDocument(
+                        new XElement("PontConfiguration",
+                            new XElement("PontId", _pontId)
+                        )
+                    );
+                    defaultConfig.Save(configPath);
+                    _logger.LogInformation("Created default pont-config.xml with PontId: {PontId}", _pontId);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to load PontId from config file, using default: {PontId}", _pontId);
+            }
+        }
+
+        private async Task RegisterDeviceAsync()
+        {
+            try
+            {
+                var payload = System.Text.Json.JsonSerializer.Serialize(new
+                {
+                    DeviceId = _deviceId,
+                    SecretHex = Convert.ToHexString(_deviceSecret)
+                });
+                using var req = new HttpRequestMessage(HttpMethod.Post, RegistryEndpoint);
+                req.Headers.Add("X-Api-Key", RegistryAdminKey);
+                req.Content = new StringContent(payload, Encoding.UTF8, "application/json");
+                var resp = await _http.SendAsync(req);
+                resp.EnsureSuccessStatusCode();
+                _logger.LogInformation("Device registered with API");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Device registration failed; API won't be able to validate proof.");
+            }
+        }
+
+        private void StartLoopbackProofServer()
+        {
+            _loopbackListener = new HttpListener();
+            _loopbackListener.Prefixes.Add("http://127.0.0.1:5858/");
+            _loopbackListener.Start();
+
+            _ = Task.Run(async () =>
+            {
+                while (_loopbackListener.IsListening)
+                {
+                    var ctx = await _loopbackListener.GetContextAsync();
+                    try
+                    {
+                        // --- CORS headers ---
+                        var origin = ctx.Request.Headers["Origin"];
+                        // If you ever need credentials/cookies, mirror the Origin and DO NOT use "*"
+                        ctx.Response.AddHeader("Access-Control-Allow-Origin", string.IsNullOrEmpty(origin) ? "*" : origin);
+                        ctx.Response.AddHeader("Vary", "Origin"); // cache correctness
+                        ctx.Response.AddHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+                        ctx.Response.AddHeader("Access-Control-Allow-Headers", "Content-Type");
+
+                        // Preflight
+                        if (ctx.Request.HttpMethod == "OPTIONS")
+                        {
+                            ctx.Response.StatusCode = 200;
+                            ctx.Response.Close();
+                            continue;
+                        }
+
+                        // Actual endpoint
+                        if (ctx.Request.HttpMethod == "GET" && ctx.Request.Url?.AbsolutePath == "/device-proof")
+                        {
+                            var ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString();
+                            var nonce = Guid.NewGuid().ToString("N");
+                            var msg = $"{_deviceId}.{ts}.{nonce}";
+                            byte[] sigBytes;
+                            using var h = new HMACSHA256(_deviceSecret);
+                            sigBytes = h.ComputeHash(Encoding.UTF8.GetBytes(msg));
+
+                            var json = $"{{\"deviceId\":\"{_deviceId}\",\"ts\":\"{ts}\",\"nonce\":\"{nonce}\",\"sig\":\"{Convert.ToHexString(sigBytes)}\", \"channel\":\"{_pontId}\"}}";
+                            var bytes = Encoding.UTF8.GetBytes(json);
+
+                            ctx.Response.StatusCode = 200;
+                            ctx.Response.ContentType = "application/json; charset=utf-8";
+                            // Include CORS on the actual response too (already added above)
+                            await ctx.Response.OutputStream.WriteAsync(bytes, 0, bytes.Length);
+                            ctx.Response.Close();
+                            continue;
+                        }
+
+                        ctx.Response.StatusCode = 404;
+                        ctx.Response.Close();
+                    }
+                    catch { /* ignore */ }
+                    finally { try { ctx.Response.Close(); } catch { } }
+                }
+            });
+
+            // If you get 403, run once:
+            // netsh http add urlacl url=http://127.0.0.1:5858/ user=Everyone
+        }
+
+        // ===== Serial Port =====
+        private void InitSerial()
+        {
+            _logger.LogInformation("Opening serial port {Port}…", SerialPortName);
+            _serialPort = new SerialPort(SerialPortName, BaudRate, PortParity, DataBits, StopBitsSetting)
+            {
+                Handshake = HandshakeSetting,
+                DtrEnable = true,
+                RtsEnable = true,
+                Encoding = Encoding.ASCII,
+                ReadTimeout = 1000,
+                WriteTimeout = 500,
+                NewLine = "\r"
+            };
+            _serialPort.DataReceived += OnDataReceived;
+            try
+            {
+                _serialPort.Open();
+                _logger.LogInformation("Opened {Port}", _serialPort.PortName);
+            }
+            catch (Exception ex)
+            {
+                LogError("Open failed", ex);
+            }
+        }
+
+        private void CloseSerial()
+        {
+            if (_serialPort == null) return;
+            _serialPort.DataReceived -= OnDataReceived;
+            if (_serialPort.IsOpen) _serialPort.Close();
+            _serialPort.Dispose();
+            _logger.LogInformation("Closed port");
+        }
+
+        private void OnDataReceived(object? sender, SerialDataReceivedEventArgs e)
+        {
+            try
+            {
+                var chunk = _serialPort!.ReadExisting();
+                if (string.IsNullOrEmpty(chunk)) return;
+
+                _receiveBuffer.Append(chunk);
+                ExtractAndProcessMessages();
+            }
+            catch (Exception ex)
+            {
+                LogError("DataReceived handling failed", ex);
+            }
+        }
+
+        // Parse buffered messages delimited by STX/ETX or CR
+        private void ExtractAndProcessMessages()
+        {
+            while (true)
+            {
+                string buf = _receiveBuffer.ToString();
+                int stx = buf.IndexOf('\x02');
+                int etx = (stx >= 0) ? buf.IndexOf('\x03', stx + 1) : -1;
+                int term = (etx > stx) ? etx : buf.IndexOf('\r', Math.Max(0, stx + 1));
+
+                if (stx < 0 && term < 0) return;
+
+                int start = (stx >= 0) ? stx + 1 : 0;
+                int end = term;
+                if (end <= start) return;
+
+                string payload = buf.Substring(start, end - start).Trim();
+                _receiveBuffer.Remove(0, end + 1);
+
+                ProcessPayload(payload);
+            }
+        }
+
+        // ===== Simulation =====
+        private void SimulateReading()
+        {
+            var chooseZero = _random.NextDouble() < 0.10; // 10% zeros
+            decimal weight = chooseZero ? 0m : 1250m + (decimal)(_random.NextDouble() * 20 - 10);
+            ProcessReading(weight, rawHint: "[sim]");
+        }
+
+        // ===== Parsing & sending =====
+        private static bool TryParseWeightKg(string text, out decimal weight)
+        {
+            var matches = Regex.Matches(text, @"[-+]?\d+(?:[.,]\d+)?");
+            if (matches.Count == 0) { weight = 0; return false; }
+
+            var tokens = matches.Select(m => m.Value).ToList();
+            int Digits(string s) => s.Replace(".", "").Replace(",", "").TrimStart('+', '-').Count(char.IsDigit);
+
+            if (tokens.Count == 3 && Digits(tokens[0]) <= 2 && Digits(tokens[2]) <= 2)
+            {
+                var mid = tokens[1].Replace(',', '.');
+                if (decimal.TryParse(mid, NumberStyles.Number, CultureInfo.InvariantCulture, out weight))
+                    return true;
+            }
+
+            decimal bestVal = 0; int bestDigits = -1; bool haveBest = false;
+            foreach (var raw in tokens)
+            {
+                var norm = raw.Replace(',', '.');
+                if (!decimal.TryParse(norm, NumberStyles.Number, CultureInfo.InvariantCulture, out var val))
+                    continue;
+
+                int d = Digits(raw);
+                if (!haveBest || d > bestDigits || (d == bestDigits && Math.Abs(val) > Math.Abs(bestVal)))
+                {
+                    bestVal = val; bestDigits = d; haveBest = true;
+                }
+            }
+            weight = haveBest ? bestVal : 0;
+            return haveBest;
+        }
+
+        private void ProcessPayload(string payload)
+        {
+            if (!TryParseWeightKg(payload, out var weight))
+            {
+                _logger.LogDebug("␦ Skip (no weight parsed) | raw: {raw}", payload);
+                return;
+            }
+            ProcessReading(weight, payload);
+        }
+
+        /// Send NOW; suppress only consecutive zeros.
+        private void ProcessReading(decimal weight, string rawHint)
+        {
+            _logger.LogInformation("Reading: {Weight:F2} kg | raw: {raw}", weight, rawHint);
+
+            bool isZero = weight == 0m;
+            if (isZero && _lastSentWasZero)
+            {
+                _logger.LogInformation("Read 0kg (suppressed duplicate send).");
+                return;
+            }
+            _lastSentWasZero = isZero;
+
+            _ = SendLiveWeight(weight);
+        }
+
+        private async Task SendLiveWeight(decimal weight)
+        {
+            var weightStr = weight.ToString("F2", CultureInfo.InvariantCulture);
+
+            // ONLY this PC's device group (on both hubs)
+            try { await _hub1.Clients.Group(_groupName).SendAsync(_pontId, _pontId, weightStr); }
+            catch (Exception ex) { LogError("Hub1 send failed", ex); }
+
+            try { await _hub2.Clients.Group(_groupName).SendAsync(_pontId, _pontId, weightStr); }
+            catch (Exception ex) { LogError("Hub2 send failed", ex); }
+
+            _logger.LogInformation("␦ Sent weight: {w} kg -> {group}", weightStr, _groupName);
+
+            _weightChannel.Writer.TryWrite(weightStr);
+        }
+
+        private async Task PipeServerLoop(CancellationToken token)
+        {
+            while (!token.IsCancellationRequested)
+            {
+                try
+                {
+                    using var pipe = new NamedPipeServerStream("WeightPipe", PipeDirection.Out, 1);
+                    await pipe.WaitForConnectionAsync(token);
+                    using var writer = new StreamWriter(pipe) { AutoFlush = true };
+                    while (pipe.IsConnected && await _weightChannel.Reader.WaitToReadAsync(token))
+                        while (_weightChannel.Reader.TryRead(out var w))
+                            await writer.WriteLineAsync(w);
+                }
+                catch { /* recreate */ }
+            }
+        }
+
+        private void LogError(string msg, Exception ex)
+            => File.AppendAllText(_logFilePath, $"[{DateTime.Now:HH:mm:ss}] ERROR: {msg}\n{ex}\n");
+        private void LogMessage(string msg)
+            => File.AppendAllText(_logFilePath, $"[{DateTime.Now:HH:mm:ss}] {msg}\n");
+    }
+}
