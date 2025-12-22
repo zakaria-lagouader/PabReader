@@ -467,8 +467,8 @@ namespace PabReader
             _lastSentMs = now;
 
             _logger.LogInformation(
-                "[WEIGHT LOG] PontId={Pont} Weight={Weight} Raw={Raw}",
-                _settings.PontId, w, raw);
+                "[WEIGHT LOG] PontId={Pont} Weight={Weight} Raw={Raw} Machine={MachineName}",
+                _settings.PontId, w, raw, Environment.MachineName);
 
             await _signalR.BroadcastWeightAsync(
                 _identity.DeviceId,
