@@ -27,6 +27,7 @@ namespace PabReader
         public int BaudRate { get; set; } = 9600;
         public bool Simulate { get; set; }
         public string PontId { get; set; } = "PaB-01";
+        public int SendIntervalMs { get; set; } = 500;
     }
 
     public class RemoteApiSettings
@@ -265,6 +266,7 @@ namespace PabReader
         private SerialPort? _serialPort;
         private readonly StringBuilder _buffer = new();
         private bool _lastSentWasZero = false;
+        private long _lastSentMs = 0;
 
         public SerialWorker(
             ILogger<SerialWorker> log,
@@ -448,9 +450,20 @@ namespace PabReader
 
         private async Task Process(decimal w, string raw)
         {
-            bool z = w == 0;
-            if (z && _lastSentWasZero) return;
-            _lastSentWasZero = z;
+            // bool z = w == 0;
+            // if (z && _lastSentWasZero) return;
+            // _lastSentWasZero = z;
+
+            // ---- NEW: throttle sending ----
+            long now = Environment.TickCount64;
+            int interval = Math.Max(1, _settings.SendIntervalMs);
+
+
+            // if not enough time passed, skip sending
+            if (now - _lastSentMs < interval)
+                return;
+
+            _lastSentMs = now;
 
             _logger.LogInformation(
                 "[WEIGHT LOG] PontId={Pont} Weight={Weight} Raw={Raw}",
