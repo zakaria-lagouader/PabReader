@@ -228,19 +228,20 @@ namespace PabReader
         {
             var g = $"device:{devId}";
             var s = w.ToString("F2", CultureInfo.InvariantCulture);
+            var machineName = Environment.MachineName;
 
             await Task.WhenAll(
-                SendSafe(_hub1, g, channel, pontId, s)
+                SendSafe(_hub1, g, channel, pontId, s, machineName)
             );
         }
 
-        private async Task SendSafe(ServiceHubContext? h, string g, string c, string p, string v)
+        private async Task SendSafe(ServiceHubContext? h, string g, string c, string p, string v, string machineName)
         {
             if (h != null)
             {
                 try
                 {
-                    await h.Clients.Group(g).SendAsync(c, p, v);
+                    await h.Clients.Group(g).SendAsync(c, p, v, machineName);
                 }
                 catch
                 {
