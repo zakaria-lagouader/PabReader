@@ -11,7 +11,7 @@ $pwd = ConvertTo-SecureString -String "1234" -Force -AsPlainText
 Export-PfxCertificate -Cert $cert -FilePath ".\certificate.pfx" -Password $pwd
 Export-Certificate  -Cert $cert -FilePath ".\certificate.cer"
 
-Import-Certificate -FilePath ".\certificate.cer" -CertStoreLocation "cert:\CurrentUser\Root"
+Import-Certificate -FilePath ".\certificate.cer" -CertStoreLocation "cert:\LocalMachine\Root"
 ```
 
 # Generate Final EXE
