@@ -19,3 +19,5 @@ Import-Certificate -FilePath ".\certificate.cer" -CertStoreLocation "cert:\Curre
 ```bash
 dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true
 ```
+
+Endpoint=https://son-pp.service.signalr.net;AccessKey=3N3A4u3fcTA582A8NvZoA1dIQysDrOOWRC3MzvnvAEhMuZbKYJ5LJQQJ99BFAC5T7U2XJ3w3AAAAASRSSrHa;Version=1.0;
