@@ -21,3 +21,5 @@ dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=
 ```
 
 Endpoint=https://son-pp.service.signalr.net;AccessKey=3N3A4u3fcTA582A8NvZoA1dIQysDrOOWRC3MzvnvAEhMuZbKYJ5LJQQJ99BFAC5T7U2XJ3w3AAAAASRSSrHa;Version=1.0;
+
+Endpoint=https://son-prd.service.signalr.net;AccessKey=ETzwpojQyejJJiPc1jdpXmh10QFVSKGJhbRrPVOslNCGcdysyTpKJQQJ99BFAC5T7U2XJ3w3AAAAASRSQKnp;Version=1.0;
